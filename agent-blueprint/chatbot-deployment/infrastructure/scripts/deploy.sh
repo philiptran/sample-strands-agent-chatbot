@@ -4,6 +4,24 @@ set -e
 
 echo "Starting Chatbot deployment..."
 
+# Load environment variables from .env file
+ENV_FILE="../../.env"
+if [ -f "$ENV_FILE" ]; then
+    echo "Loading environment variables from $ENV_FILE"
+    # Use set -a to automatically export all variables, then source the file
+    set -a
+    source "$ENV_FILE"
+    set +a
+    echo "✅ Environment variables loaded successfully"
+    echo "📋 Key configuration:"
+    echo "  - AWS_REGION: ${AWS_REGION:-us-west-2}"
+    echo "  - ENABLE_COGNITO: ${ENABLE_COGNITO:-false}"
+    echo "  - CORS_ORIGINS: ${CORS_ORIGINS:-not set}"
+    echo "  - ALLOWED_IP_RANGES: ${ALLOWED_IP_RANGES:-not set}"
+else
+    echo "No .env file found at $ENV_FILE, using environment defaults"
+fi
+
 # Check if Docker is running
 if ! docker info > /dev/null 2>&1; then
     echo "Error: Docker is not running. Please start Docker and try again."
@@ -52,7 +70,7 @@ CURRENT_DIR=$(pwd)
 
 # Build and push Backend
 echo "Building backend container..."
-cd ../../../../chatbot-app/backend
+cd ../../../chatbot-app/backend
 docker build --platform linux/amd64 -t chatbot-backend .
 docker tag chatbot-backend:latest $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/chatbot-backend:latest
 docker push $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/chatbot-backend:latest
@@ -69,8 +87,8 @@ if [ "$ENABLE_COGNITO" != "true" ]; then
     docker push $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/chatbot-frontend:latest
 fi
 
-# Return to CDK directory (parent of scripts directory)
-cd "$CURRENT_DIR/.."
+# Return to CDK directory (infrastructure directory)
+cd "$CURRENT_DIR"
 
 # Check if log group already exists and set environment variable accordingly
 if aws logs describe-log-groups --log-group-name-prefix "agents/strands-agent-logs" --region $AWS_REGION --query 'logGroups[?logGroupName==`agents/strands-agent-logs`]' --output text | grep -q "agents/strands-agent-logs"; then
@@ -108,6 +126,34 @@ if [ "$ENABLE_COGNITO" = "true" ]; then
 
     echo "✅ Cognito configuration validated successfully"
 
+    # Save Cognito configuration to master .env file only
+    echo "💾 Saving Cognito configuration to master .env file..."
+    
+    # Save to agent-blueprint/.env (single master .env file)
+    MAIN_ENV_FILE="../../.env"
+    if [ ! -f "$MAIN_ENV_FILE" ]; then
+        touch "$MAIN_ENV_FILE"
+    fi
+    
+    # Remove existing Cognito entries and add new ones
+    grep -v "^COGNITO_USER_POOL_ID=" "$MAIN_ENV_FILE" > "$MAIN_ENV_FILE.tmp" 2>/dev/null || touch "$MAIN_ENV_FILE.tmp"
+    grep -v "^COGNITO_USER_POOL_CLIENT_ID=" "$MAIN_ENV_FILE.tmp" > "$MAIN_ENV_FILE.tmp2" 2>/dev/null || touch "$MAIN_ENV_FILE.tmp2"
+    grep -v "^NEXT_PUBLIC_COGNITO_USER_POOL_ID=" "$MAIN_ENV_FILE.tmp2" > "$MAIN_ENV_FILE.tmp3" 2>/dev/null || touch "$MAIN_ENV_FILE.tmp3"
+    grep -v "^NEXT_PUBLIC_COGNITO_USER_POOL_CLIENT_ID=" "$MAIN_ENV_FILE.tmp3" > "$MAIN_ENV_FILE" 2>/dev/null || touch "$MAIN_ENV_FILE"
+    
+    # Add Cognito configuration to master .env file
+    echo "COGNITO_USER_POOL_ID=$COGNITO_USER_POOL_ID" >> "$MAIN_ENV_FILE"
+    echo "COGNITO_USER_POOL_CLIENT_ID=$COGNITO_USER_POOL_CLIENT_ID" >> "$MAIN_ENV_FILE"
+    echo "NEXT_PUBLIC_COGNITO_USER_POOL_ID=$COGNITO_USER_POOL_ID" >> "$MAIN_ENV_FILE"
+    echo "NEXT_PUBLIC_COGNITO_USER_POOL_CLIENT_ID=$COGNITO_USER_POOL_CLIENT_ID" >> "$MAIN_ENV_FILE"
+    echo "NEXT_PUBLIC_AWS_REGION=$AWS_REGION" >> "$MAIN_ENV_FILE"
+    
+    # Clean up temp files
+    rm -f "$MAIN_ENV_FILE.tmp" "$MAIN_ENV_FILE.tmp2" "$MAIN_ENV_FILE.tmp3"
+    
+    echo "✅ Cognito configuration saved to master .env file: $MAIN_ENV_FILE"
+    echo "📋 All applications will use this single source of truth for environment variables"
+
     # Build frontend with Cognito configuration
     echo "Building frontend container with Cognito..."
     cd ../../../chatbot-app/frontend
@@ -120,7 +166,7 @@ if [ "$ENABLE_COGNITO" = "true" ]; then
     docker tag chatbot-frontend:latest $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/chatbot-frontend:latest
     docker push $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/chatbot-frontend:latest
 
-    cd "$CURRENT_DIR/.."
+    cd "$CURRENT_DIR"
 fi
 
 # CORS Origins Configuration (used for both API access and embedding)
