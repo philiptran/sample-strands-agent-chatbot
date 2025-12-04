@@ -223,25 +223,25 @@ export class ChatbotStack extends cdk.Stack {
     });
 
 
-    // Create security group for ALB (CloudFront access only)
+    // Create security group for ALB (CloudFront VPC Origins access only)
     const albSecurityGroup = new ec2.SecurityGroup(this, 'ChatbotAlbSecurityGroup', {
       vpc,
-      description: 'Security group for Chatbot Application Load Balancer - CloudFront only',
+      description: 'Security group for Chatbot Application Load Balancer - CloudFront VPC Origins only',
       allowAllOutbound: true
     });
 
-    // Allow inbound HTTP traffic from CloudFront IP ranges only
-    // Using CloudFront managed prefix list ID for automatic IP range management
+    // Allow inbound HTTP traffic from VPC CIDR (CloudFront VPC Origins will connect from within VPC)
+    // VPC Origins automatically manages secure connectivity without requiring prefix lists
     albSecurityGroup.addIngressRule(
-      ec2.Peer.prefixList('pl-82a045eb'),
+      ec2.Peer.ipv4(vpc.vpcCidrBlock),
       ec2.Port.tcp(80),
-      'Allow HTTP traffic from CloudFront'
+      'Allow HTTP traffic from VPC for CloudFront VPC Origins'
     );
 
-    // Application Load Balancer
+    // Application Load Balancer - Internal-facing for CloudFront VPC Origins
     const alb = new elbv2.ApplicationLoadBalancer(this, 'ChatbotALB', {
       vpc,
-      internetFacing: true,
+      internetFacing: false,  // Changed to internal for VPC Origins
       securityGroup: albSecurityGroup,
       idleTimeout: cdk.Duration.seconds(3600),
     });
@@ -389,9 +389,23 @@ export class ChatbotStack extends cdk.Stack {
       cookieBehavior: cloudfront.OriginRequestCookieBehavior.all(),
     });
 
-    // CloudFront Distribution (for HTTPS and global CDN)
+    // Create VPC Origin resource for CloudFront to connect to internal ALB
+    // VPC Origins feature allows CloudFront to securely connect to resources in private subnets
+    // Reference: https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-cloudfront-virtual-private-cloud-vpc-origins-shield-your-web-applications-from-public-internet/
+    const vpcOriginResource = new cloudfront.CfnVpcOrigin(this, 'ChatbotVpcOrigin', {
+      vpcOriginEndpointConfig: {
+        name: 'chatbot-alb-vpc-origin',
+        arn: alb.loadBalancerArn,
+        httpPort: 80,
+        originProtocolPolicy: 'http-only',
+      },
+    });
+
+    // CloudFront Distribution with VPC Origins (for HTTPS and global CDN)
+    // Using L1 construct to configure VPC Origins until L2 support is available
     const distribution = new cloudfront.Distribution(this, 'ChatbotCloudFront', {
       defaultBehavior: {
+        // Temporary origin - will be replaced via escape hatch
         origin: new origins.LoadBalancerV2Origin(alb, {
           protocolPolicy: cloudfront.OriginProtocolPolicy.HTTP_ONLY,
           httpPort: 80,
@@ -404,8 +418,24 @@ export class ChatbotStack extends cdk.Stack {
         compress: true,
       },
       priceClass: cloudfront.PriceClass.PRICE_CLASS_100, // Use only North America and Europe
-      comment: 'CloudFront distribution for Chatbot application with HTTPS support',
+      comment: 'CloudFront distribution with VPC Origins for secure access to internal ALB',
     });
+
+    // Override the default origin to use VPC Origin configuration
+    const cfnDistribution = distribution.node.defaultChild as cloudfront.CfnDistribution;
+    cfnDistribution.addPropertyOverride('DistributionConfig.Origins.0', {
+      Id: `${alb.loadBalancerName}-vpc-origin`,
+      DomainName: alb.loadBalancerDnsName,
+      VpcOriginConfig: {
+        VpcOriginId: vpcOriginResource.attrId,
+        OriginProtocolPolicy: 'http-only',
+        OriginReadTimeout: 30,
+        OriginKeepaliveTimeout: 5,
+      },
+    });
+
+    // Ensure VPC Origin is created before distribution
+    distribution.node.addDependency(vpcOriginResource);
 
     // Update Cognito User Pool Client with CloudFront callback URL (if Cognito is enabled)
     if (props?.enableCognito && props?.userPoolClientId) {
@@ -523,8 +553,8 @@ export class ChatbotStack extends cdk.Stack {
     // Security Information
     new cdk.CfnOutput(this, 'SecurityNote', {
       value: props?.enableCognito
-        ? 'ALB is protected with CloudFront and Cognito authentication. All endpoints require user login.'
-        : 'ALB is protected with CloudFront-only access. Direct ALB access is blocked.',
+        ? 'Internal ALB is protected with CloudFront VPC Origins and Cognito authentication. All endpoints require user login. ALB is not accessible from public internet.'
+        : 'Internal ALB is protected with CloudFront VPC Origins. Direct access is blocked - only CloudFront can reach the ALB.',
       description: 'Security Configuration Information'
     });
 
